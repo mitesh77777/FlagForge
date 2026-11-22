@@ -1,0 +1,181 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Required by the Redis integration test (two API instances over Pub/Sub).
+  REDIS_TEST_URL: redis://localhost:6379
+
+jobs:
+  # ── Static analysis + unit/integration tests ───────────────────────────────
+  verify:
+    name: Typecheck · Lint · Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: flagforge
+          POSTGRES_PASSWORD: flagforge
+          POSTGRES_DB: flagforge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U flagforge -d flagforge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
+    env:
+      DATABASE_URL: postgres://flagforge:flagforge@localhost:5432/flagforge
+      REDIS_URL: redis://localhost:6379
+      CACHE_NAMESPACE: flagforge-ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck + lint
+        run: pnpm turbo run typecheck lint
+
+      - name: Unit + integration tests
+        run: pnpm turbo run test
+
+  # ── Production build, then a real migrate → seed → HTTP smoke test ─────────
+  build:
+    name: Build · Migrate · Seed · Smoke
+    runs-on: ubuntu-latest
+    needs: verify
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: flagforge
+          POSTGRES_PASSWORD: flagforge
+          POSTGRES_DB: flagforge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U flagforge -d flagforge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
+    env:
+      DATABASE_URL: postgres://flagforge:flagforge@localhost:5432/flagforge
+      REDIS_URL: redis://localhost:6379
+      CACHE_NAMESPACE: flagforge-ci
+      API_HOST: 127.0.0.1
+      API_PORT: 8080
+      NEXT_PUBLIC_API_URL: http://127.0.0.1:8080
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build all packages and apps
+        run: pnpm turbo run build
+
+      - name: Apply migrations
+        run: node apps/api/dist/db/migrate.js
+
+      - name: Seed the demo project
+        run: node apps/api/dist/db/seed.js
+
+      - name: Boot the API and smoke-test both planes
+        shell: bash
+        run: |
+          set -euo pipefail
+          node apps/api/dist/server.js &
+          API_PID=$!
+          trap 'kill $API_PID 2>/dev/null || true' EXIT
+
+          echo "Waiting for the API to become healthy..."
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/health > /dev/null; then
+              echo "API healthy after ${i}s"; break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8080/health > /dev/null
+
+          echo "Control plane: GET /api/sandbox"
+          curl -sf http://127.0.0.1:8080/api/sandbox | head -c 200; echo
+
+          echo "Data plane: POST /v1/evaluate (cold → DB-FALLBACK)"
+          curl -sfi -X POST http://127.0.0.1:8080/v1/evaluate \
+            -H 'content-type: application/json' \
+            -H 'x-sdk-key: ff_live_demo_7f3a91c4e8b25d60' \
+            -d '{"userId":"user_demo_001","attributes":{"plan":"enterprise"}}' \
+            | tr -d '\r' | grep -iE '^(HTTP/|x-cache-status|x-eval-time-ms)'
+
+          echo "Data plane: POST /v1/evaluate (warm → L1-HIT)"
+          curl -sfi -X POST http://127.0.0.1:8080/v1/evaluate \
+            -H 'content-type: application/json' \
+            -H 'x-sdk-key: ff_live_demo_7f3a91c4e8b25d60' \
+            -d '{"userId":"user_demo_001","attributes":{"plan":"enterprise"}}' \
+            | tr -d '\r' | grep -iE '^(HTTP/|x-cache-status|x-eval-time-ms)'
+
+          echo "Data plane: POST /v1/evaluate/batch"
+          curl -sf -X POST http://127.0.0.1:8080/v1/evaluate/batch \
+            -H 'content-type: application/json' \
+            -H 'x-sdk-key: ff_live_demo_7f3a91c4e8b25d60' \
+            -d '{"userId":"user_demo_002","attributes":{"plan":"pro","country":"US"}}' \
+            | head -c 300; echo
+
+          echo "AI: GET /api/ai/status"
+          curl -sf http://127.0.0.1:8080/api/ai/status; echo
+
+          echo "AI: POST /api/ai/compile-rule (deterministic fallback)"
+          curl -sf -X POST http://127.0.0.1:8080/api/ai/compile-rule \
+            -H 'content-type: application/json' \
+            -d '{"prompt":"25% of Pro users in India on version 2.4.0 or higher","flagKey":"new-checkout-flow"}' \
+            | head -c 400; echo
+
+          echo "Smoke test passed."

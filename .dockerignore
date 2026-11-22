@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+**/dist
+**/.next
+**/.turbo
+.git
+.github
+coverage
+benchmarks/results
+*.log
+.env
+.env.local

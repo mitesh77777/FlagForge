@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build stage — installs the workspace, builds the shared packages, then the
+# Next.js app. NEXT_PUBLIC_* values are inlined into the browser bundle at build
+# time, so the API origin must be supplied as a build arg (not just at runtime).
+# ─────────────────────────────────────────────────────────────────────────────
+FROM node:20-alpine AS build
+RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
+WORKDIR /app
+
+ARG NEXT_PUBLIC_API_URL=http://localhost:8080
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+
+# Manifests first for better layer caching.
+COPY package.json pnpm-workspace.yaml turbo.json tsconfig.base.json ./
+COPY packages/evaluator/package.json ./packages/evaluator/package.json
+COPY packages/sdk/package.json ./packages/sdk/package.json
+COPY apps/web/package.json ./apps/web/package.json
+
+RUN pnpm install --no-frozen-lockfile
+
+COPY packages ./packages
+COPY apps/web ./apps/web
+
+RUN pnpm --filter @flagforge/evaluator build \
+ && pnpm --filter @flagforge/sdk build \
+ && pnpm --filter @flagforge/web build
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime stage — compiled Next.js output + workspace packages.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM node:20-alpine AS runner
+RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV PORT=3000
+
+COPY --from=build /app/package.json /app/pnpm-workspace.yaml ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/packages ./packages
+COPY --from=build /app/apps/web ./apps/web
+
+EXPOSE 3000
+
+CMD ["pnpm", "--filter", "@flagforge/web", "start"]

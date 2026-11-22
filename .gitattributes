@@ -1,0 +1,27 @@
+# Normalise line endings so the repo behaves identically on Windows, Linux and
+# inside Docker builds.
+#
+# This matters here: Dockerfiles, shell snippets in CI, and `fly.toml` are all
+# consumed by Linux tooling. If any of them were committed with CRLF, a Docker
+# `RUN`/`CMD` or a bash step could fail with stray `\r` characters.
+#
+# `text=auto` detects text files, `eol=lf` stores *and* checks them out with LF,
+# which removes any dependence on a contributor's `core.autocrlf` setting.
+
+* text=auto eol=lf
+
+# Windows-native scripts should keep CRLF if any are ever added.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

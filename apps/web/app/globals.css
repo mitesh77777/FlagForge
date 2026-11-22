@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  min-height: 100%;
+  background-color: #07080b;
+}
+
+body {
+  color: #e6e8ee;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Subtle blueprint grid used on the landing hero. */
+.bg-grid {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: 44px 44px;
+}
+
+.bg-radial-fade {
+  background:
+    radial-gradient(60rem 30rem at 50% -10%, rgba(16, 185, 129, 0.14), transparent 70%),
+    radial-gradient(40rem 24rem at 85% 10%, rgba(56, 189, 248, 0.08), transparent 70%);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #232833;
+  border-radius: 8px;
+  border: 2px solid #07080b;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #333a48;
+}
+
+/* Range slider */
+input[type='range'].ff-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border-radius: 999px;
+  outline: none;
+}
+input[type='range'].ff-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: #34d399;
+  border: 2px solid #052e22;
+  box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.12);
+  cursor: pointer;
+}
+input[type='range'].ff-range::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: #34d399;
+  border: 2px solid #052e22;
+  cursor: pointer;
+}

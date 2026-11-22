@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build stage — installs the workspace and compiles evaluator + api to dist/.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM node:20-alpine AS build
+RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
+WORKDIR /app
+
+# Manifests first for better layer caching.
+COPY package.json pnpm-workspace.yaml turbo.json tsconfig.base.json ./
+COPY packages/evaluator/package.json ./packages/evaluator/package.json
+COPY apps/api/package.json ./apps/api/package.json
+
+RUN pnpm install --no-frozen-lockfile
+
+COPY packages ./packages
+COPY apps/api ./apps/api
+
+RUN pnpm --filter @flagforge/evaluator build \
+ && pnpm --filter @flagforge/api build
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime stage — lean image with compiled output + production deps only.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM node:20-alpine AS runner
+RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV API_HOST=0.0.0.0
+ENV API_PORT=8080
+
+COPY --from=build /app/package.json /app/pnpm-workspace.yaml ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/packages ./packages
+COPY --from=build /app/apps/api ./apps/api
+
+EXPOSE 8080
+
+# Migrate → seed (only if the demo project is absent) → serve. Compose
+# `depends_on` guarantees the DB and Redis are healthy before this runs.
+#
+# `--if-missing` keeps a deployed instance from wiping flag state and audit
+# history on every restart. Use `--force` (or SEED_DEMO=force) for a reset, and
+# SEED_DEMO=false to never seed at all.
+CMD ["sh", "-c", "node apps/api/dist/db/migrate.js && node apps/api/dist/db/seed.js --if-missing && node apps/api/dist/server.js"]

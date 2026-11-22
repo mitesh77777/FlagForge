@@ -1,0 +1,53 @@
+# FlagForge API — Fly.io configuration
+#
+# Deploy:  fly apps create <unique-app-name>   (then set `app` below)
+#          fly secrets set DATABASE_URL=… REDIS_URL=… CORS_ORIGINS=… \
+#                          DEFAULT_ACTOR_EMAIL=…
+#          fly deploy
+#
+# `app` must be globally unique across Fly. Change it before deploying.
+
+app = "flagforge-api"
+# Match this to your Neon region to keep DB latency low.
+# Common: sin (Singapore) · bom (Mumbai) · iad (Virginia) · lhr (London) · fra (Frankfurt)
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile.api"
+
+# Applies migrations in a throwaway machine before the new version takes
+# traffic, so a bad migration fails the deploy instead of half-starting.
+[deploy]
+  release_command = "node apps/api/dist/db/migrate.js"
+
+[env]
+  NODE_ENV = "production"
+  API_HOST = "0.0.0.0"
+  # Pinned so the app and `internal_port` can never disagree.
+  PORT = "8080"
+  CACHE_NAMESPACE = "flagforge-prod"
+  L2_CACHE_TTL_SECONDS = "300"
+  # Seeds only when the demo project is absent. Set to "force" for a reset,
+  # "false" to never seed. (Secrets like DATABASE_URL are NOT set here.)
+  SEED_DEMO = ""
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+
+  # SSE connections and the in-process L1 cache live in memory, so the machine
+  # must not be stopped or replaced on idle.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
