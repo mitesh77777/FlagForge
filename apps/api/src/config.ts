@@ -4,6 +4,20 @@ import { z } from 'zod';
  * Environment configuration, validated once at boot. Every field has a sane
  * default so the API starts with zero configuration in development.
  */
+/**
+ * A boolean environment flag.
+ *
+ * `z.coerce.boolean()` is unusable here because `Boolean('false') === true`.
+ * These are the only accepted spellings; a blank value falls back to the default
+ * because `loadConfig` prunes whitespace-only entries first.
+ */
+function booleanish(defaultValue: 'true' | 'false') {
+  return z
+    .enum(['true', 'false', '1', '0'])
+    .default(defaultValue)
+    .transform((value) => value === 'true' || value === '1');
+}
+
 const configSchema = z.object({
   NODE_ENV: z
     .enum(['development', 'test', 'production'])
@@ -31,6 +45,36 @@ const configSchema = z.object({
   ADMIN_API_TOKEN: z.string().min(1).optional(),
   /** Default actor recorded in the audit log when none is supplied. */
   DEFAULT_ACTOR_EMAIL: z.string().default('admin@flagforge.dev'),
+
+  /**
+   * HMAC secret for session tokens. Must be set in production — the default is
+   * deliberately obvious so an unconfigured deployment is easy to spot.
+   */
+  SESSION_SECRET: z.string().min(16).default('dev-insecure-session-secret'),
+  /** Session lifetime in seconds (default 7 days). */
+  SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(604_800),
+  /** Email/password for the one-click demo account. */
+  DEMO_EMAIL: z.string().default('demo@flagforge.dev'),
+  DEMO_PASSWORD: z.string().min(8).default('demo1234'),
+
+  /** Observability and abuse protection. */
+  METRICS_ENABLED: booleanish('true'),
+  RATE_LIMIT_ENABLED: booleanish('true'),
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  /** Per SDK key, per window. Generous; lower it for real tenants. */
+  RATE_LIMIT_DATA_MAX: z.coerce.number().int().positive().default(20_000),
+  /** Per client IP, per window. */
+  RATE_LIMIT_CONTROL_MAX: z.coerce.number().int().positive().default(120),
+
+  /**
+   * How long an outgoing SDK key keeps authenticating after a rotation.
+   * `0` performs a hard cutover.
+   */
+  SDK_KEY_ROTATION_GRACE_SECONDS: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .default(86_400),
 
   /** OpenAI-compatible LLM settings. Absent key ⇒ deterministic offline mode. */
   LLM_API_KEY: z.string().min(1).optional(),
