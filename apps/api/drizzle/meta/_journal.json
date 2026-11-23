@@ -8,6 +8,20 @@
       "when": 1731000000000,
       "tag": "0000_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1731100000000,
+      "tag": "0001_sdk_key_rotation_grace",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1731200000000,
+      "tag": "0002_users_and_ownership",
+      "breakpoints": true
     }
   ]
 }

@@ -13,17 +13,48 @@ import {
 import type { FlagOverrides, JsonValue, TargetingRule } from '@flagforge/evaluator';
 
 /**
- * ── projects ──────────────────────────────────────────────────────────────────
- * Top-level tenant boundary. Low-frequency control-plane entity.
+ * ── users ─────────────────────────────────────────────────────────────────────
+ * Account records for the control plane. Passwords are stored as scrypt hashes
+ * (see `lib/password.ts`); the raw password is never persisted or logged.
  */
-export const projects = pgTable('projects', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  name: text('name').notNull(),
-  slug: text('slug').notNull().unique(),
-  createdAt: timestamp('created_at', { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
+export const users = pgTable(
+  'users',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    email: text('email').notNull(),
+    passwordHash: text('password_hash').notNull(),
+    name: text('name').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => ({
+    emailUnique: uniqueIndex('users_email_key').on(t.email),
+  }),
+);
+
+/**
+ * ── projects ──────────────────────────────────────────────────────────────────
+ * Top-level tenant boundary. `owner_id` scopes every control-plane query to a
+ * single account; a project with a null owner is an orphan and is invisible.
+ */
+export const projects = pgTable(
+  'projects',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    ownerId: uuid('owner_id').references(() => users.id, {
+      onDelete: 'cascade',
+    }),
+    name: text('name').notNull(),
+    slug: text('slug').notNull().unique(),
+    createdAt: timestamp('created_at', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => ({
+    ownerIdx: index('projects_owner_id_idx').on(t.ownerId),
+  }),
+);
 
 /**
  * ── environments ──────────────────────────────────────────────────────────────
@@ -40,6 +71,16 @@ export const environments = pgTable(
     name: text('name').notNull(),
     /** SHA-256 hex of the raw SDK key. Used for O(1) auth lookup. */
     sdkKeyHash: text('sdk_key_hash').notNull(),
+    /**
+     * The outgoing key, retained for a bounded grace window so a rotation does
+     * not break clients that have not yet picked up the new key. Cleared by the
+     * next rotation, and ignored once `sdkKeyPrevExpiresAt` has passed.
+     */
+    sdkKeyPrevHash: text('sdk_key_prev_hash'),
+    /** When the outgoing key stops authenticating. `null` = never expires. */
+    sdkKeyPrevExpiresAt: timestamp('sdk_key_prev_expires_at', {
+      withTimezone: true,
+    }),
     /** Non-secret display prefix, e.g. `ff_live_demo`. */
     sdkKeyPrefix: text('sdk_key_prefix').notNull(),
     createdAt: timestamp('created_at', { withTimezone: true })
@@ -52,6 +93,9 @@ export const environments = pgTable(
       t.name,
     ),
     sdkKeyHashIdx: index('environments_sdk_key_hash_idx').on(t.sdkKeyHash),
+    sdkKeyPrevHashIdx: index('environments_sdk_key_prev_hash_idx').on(
+      t.sdkKeyPrevHash,
+    ),
   }),
 );
 
@@ -127,6 +171,8 @@ export const auditLogs = pgTable(
   }),
 );
 
+export type User = typeof users.$inferSelect;
+export type NewUser = typeof users.$inferInsert;
 export type Project = typeof projects.$inferSelect;
 export type NewProject = typeof projects.$inferInsert;
 export type Environment = typeof environments.$inferSelect;
