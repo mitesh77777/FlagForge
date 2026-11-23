@@ -1,8 +1,9 @@
 import 'dotenv/config';
 import { eq } from 'drizzle-orm';
 import type { JsonValue } from '@flagforge/evaluator';
+import { hashPassword } from '../lib/password.js';
 import { createDatabase, type Database } from './client.js';
-import { auditLogs, environments, flags, projects } from './schema.js';
+import { auditLogs, environments, flags, projects, users } from './schema.js';
 import { DEMO_SDK_KEYS, SEED_FLAGS, keyPrefix, sha256 } from './seed-data.js';
 
 export const DEMO_PROJECT_SLUG = 'flagforge-demo';
@@ -19,6 +20,8 @@ export interface SeedOptions {
    * deployed instance is never reset by a restart or redeploy.
    */
   force?: boolean;
+  /** Account that owns the demo project. */
+  ownerId?: string;
 }
 
 /**
@@ -44,6 +47,7 @@ export async function seedDatabase(
     .values({
       name: 'Acme SaaS (Demo)',
       slug: DEMO_PROJECT_SLUG,
+      ownerId: options.ownerId ?? null,
     })
     .returning();
 
@@ -143,6 +147,59 @@ export async function seedDatabase(
   return true;
 }
 
+/** Create (or fetch) the account that owns the seeded demo workspace. */
+export async function ensureDemoUser(
+  db: Database,
+  credentials: { email: string; password: string; name?: string },
+) {
+  const email = credentials.email.trim().toLowerCase();
+  const existing = await db.query.users.findFirst({
+    where: (row, { eq: eqFn }) => eqFn(row.email, email),
+  });
+  if (existing) return existing;
+
+  const passwordHash = await hashPassword(credentials.password);
+  const [created] = await db
+    .insert(users)
+    .values({
+      email,
+      passwordHash,
+      name: credentials.name ?? 'Demo User',
+    })
+    .returning();
+  if (!created) throw new Error('failed to create demo user');
+  return created;
+}
+
+/**
+ * Guarantee the demo account and its workspace exist. Used by the seed script and
+ * by `POST /api/auth/demo`, so the one-click demo works even on a deployment that
+ * runs with `SEED_DEMO=false`.
+ */
+export async function ensureDemoWorkspace(
+  db: Database,
+  credentials: { email: string; password: string; name?: string },
+) {
+  const user = await ensureDemoUser(db, credentials);
+
+  const [project] = await db
+    .select({ id: projects.id, ownerId: projects.ownerId })
+    .from(projects)
+    .where(eq(projects.slug, DEMO_PROJECT_SLUG))
+    .limit(1);
+
+  // Backfill ownership for a demo project seeded before users existed.
+  if (project && !project.ownerId) {
+    await db
+      .update(projects)
+      .set({ ownerId: user.id })
+      .where(eq(projects.id, project.id));
+  }
+
+  await seedDatabase(db, { force: false, ownerId: user.id });
+  return { user };
+}
+
 function snapshot(row: {
   key: string;
   enabled: boolean;
@@ -180,13 +237,20 @@ async function main(): Promise<void> {
     'postgres://flagforge:flagforge@localhost:5432/flagforge';
   const { db, pool } = createDatabase(url);
   try {
-    const seeded = await seedDatabase(db, { force });
+    const demoPassword = process.env.DEMO_PASSWORD ?? 'demo1234';
+    const demoUser = await ensureDemoUser(db, {
+      email: process.env.DEMO_EMAIL ?? 'demo@flagforge.dev',
+      password: demoPassword,
+    });
+
+    const seeded = await seedDatabase(db, { force, ownerId: demoUser.id });
     if (seeded) {
       console.log(
         `✅ seeded demo project "${DEMO_PROJECT_SLUG}" (prod + dev, ${SEED_FLAGS.length} flags)`,
       );
       console.log(`   demo prod SDK key: ${DEMO_SDK_KEYS.prod}`);
       console.log(`   demo dev  SDK key: ${DEMO_SDK_KEYS.dev}`);
+      console.log(`   demo login:        ${demoUser.email} / ${demoPassword}`);
     } else {
       console.log(
         `ℹ️  demo project "${DEMO_PROJECT_SLUG}" already exists — left untouched (use --force to reset)`,
