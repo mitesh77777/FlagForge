@@ -1,12 +1,18 @@
 import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
+import rateLimit from '@fastify/rate-limit';
 import { evaluateAll } from '@flagforge/evaluator';
-import Fastify, { type FastifyInstance } from 'fastify';
+import { sql } from 'drizzle-orm';
+import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { Redis } from 'ioredis';
 import { ZodError } from 'zod';
 import { registerAiRoutes } from './ai/routes.js';
+import { registerAuthRoutes } from './auth/routes.js';
+import { AuthService } from './auth/service.js';
 import type { AppConfig } from './config.js';
 import { FlagService } from './control-plane/flag-service.js';
 import { registerControlPlane } from './control-plane/routes.js';
+import { extractSdkKey } from './data-plane/auth.js';
 import { FlagCache } from './data-plane/cache.js';
 import {
   InvalidationBus,
@@ -18,6 +24,7 @@ import { EvaluationService } from './data-plane/service.js';
 import { SseHub } from './data-plane/sse.js';
 import { createDatabase, type DatabaseHandle } from './db/client.js';
 import { AppError } from './lib/errors.js';
+import { createMetrics, type Metrics } from './lib/metrics.js';
 
 export interface BuildAppOptions {
   config: AppConfig;
@@ -28,6 +35,47 @@ export interface BuildAppOptions {
   redis?: Redis;
   redisSub?: Redis;
 }
+
+// ── Path helpers ─────────────────────────────────────────────────────────────
+
+/** Strip the query string. `req.url` is the raw target, so it must be parsed. */
+function pathOf(url: string): string {
+  const queryAt = url.indexOf('?');
+  return queryAt === -1 ? url : url.slice(0, queryAt);
+}
+
+function isDataPlanePath(url: string): boolean {
+  return pathOf(url).startsWith('/v1/');
+}
+
+/** Health and metrics must never consume (or be blocked by) a rate-limit budget. */
+function isRateLimitExempt(url: string): boolean {
+  const path = pathOf(url);
+  return path === '/' || path.startsWith('/health') || path.startsWith('/metrics');
+}
+
+async function withTimeout<T>(
+  work: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} check timed out after ${ms}ms`)),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+const READINESS_TIMEOUT_MS = 2_000;
 
 /**
  * Compose the two planes around a shared evaluator + cache.
@@ -53,6 +101,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   await app.register(cors, {
     origin: config.corsOrigins.length > 0 ? config.corsOrigins : true,
     credentials: true,
+    // Cache the preflight for a day: without this every cross-origin POST to
+    // /v1/evaluate pays a second round trip, which dominates a sub-5ms path.
+    maxAge: 86_400,
     exposedHeaders: ['X-Cache-Status', 'X-Eval-Time-Ms'],
     allowedHeaders: [
       'content-type',
@@ -60,6 +111,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       'x-sdk-key',
       'x-actor-email',
     ],
+  });
+
+  // Security headers. The API returns JSON only (never HTML), so CSP would be
+  // noise, but CORP must be cross-origin: the dashboard is served from a
+  // different origin and reads these responses from the browser.
+  await app.register(helmet, {
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
   });
 
   // ── Resource ownership (injected resources are left for the caller) ────────
@@ -83,8 +143,27 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     onError: (err) => app.log.warn({ err }, 'L2 cache error; degraded to L1+DB'),
   });
   const loader = createDbSnapshotLoader(dbHandle.db);
-  const service = new EvaluationService(cache, loader);
   const hub = new SseHub();
+
+  // Metrics needs live gauges from the hub and the service; the service needs
+  // metrics for its cold-load counter. Break the cycle with a mutable holder
+  // whose functions are only invoked at scrape/request time.
+  const gaugeSources = {
+    sseClients: () => 0,
+    inflightLoads: () => 0,
+    coalescedLoads: () => 0,
+  };
+  const metrics = createMetrics(gaugeSources);
+
+  const service = new EvaluationService(cache, loader, {
+    onSnapshotLoad: ({ coalesced }) =>
+      metrics.snapshotLoads.inc({ cause: coalesced ? 'coalesced' : 'postgres' }),
+  });
+
+  gaugeSources.sseClients = () => hub.size;
+  gaugeSources.inflightLoads = () => service.inflightLoads;
+  gaugeSources.coalescedLoads = () => service.coalescedLoads;
+
   const bus = new InvalidationBus(redis, redisSub, undefined, (err) =>
     app.log.error({ err }, 'invalidation bus error'),
   );
@@ -97,10 +176,149 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     logger: app.log,
   });
 
+  const auth = new AuthService({
+    db: dbHandle.db,
+    flags: flagService,
+    sessionSecret: config.SESSION_SECRET,
+    sessionTtlSeconds: config.SESSION_TTL_SECONDS,
+    demoEmail: config.DEMO_EMAIL,
+    demoPassword: config.DEMO_PASSWORD,
+  });
+
+  // ── Rate limiting (per SDK key on the data plane, per IP on the control) ───
+  if (config.RATE_LIMIT_ENABLED) {
+    await app.register(rateLimit, {
+      global: true,
+      timeWindow: config.RATE_LIMIT_WINDOW_MS,
+      max: (req: FastifyRequest) =>
+        isDataPlanePath(req.url)
+          ? config.RATE_LIMIT_DATA_MAX
+          : config.RATE_LIMIT_CONTROL_MAX,
+      keyGenerator: (req: FastifyRequest) =>
+        isDataPlanePath(req.url) ? (extractSdkKey(req) ?? req.ip) : req.ip,
+      allowList: (req: FastifyRequest) => isRateLimitExempt(req.url),
+      // `statusCode` must be present: the plugin surfaces this object through the
+      // error handler, which maps unknown errors to 500.
+      errorResponseBuilder: (_req, context) => ({
+        statusCode: 429,
+        error: 'rate_limited',
+        message: `rate limit exceeded; retry in ${Math.ceil(
+          Number(context.ttl) / 1000,
+        )}s`,
+      }),
+    });
+  }
+
   // ── Routes ─────────────────────────────────────────────────────────────────
   await registerDataPlane(app, { service, hub });
-  await registerControlPlane(app, { flagService, config });
-  await registerAiRoutes(app, { config });
+  await registerAuthRoutes(app, { auth });
+  await registerControlPlane(app, {
+    flagService,
+    auth,
+    config,
+    service,
+    metrics: config.METRICS_ENABLED ? metrics : undefined,
+  });
+  await registerAiRoutes(app, {
+    config,
+    auth,
+    onCompile: (source) => metrics.aiCompiles.inc({ source }),
+  });
+
+  // ── Request instrumentation ────────────────────────────────────────────────
+  // Derived entirely from what the app already does: latency from Fastify's own
+  // timer, cache tier from the response header the data plane sets.
+  app.addHook('onResponse', (req, reply, done) => {
+    metrics.httpDuration.observe(
+      {
+        method: req.method,
+        route: req.routeOptions?.url ?? 'unmatched',
+        status: String(reply.statusCode),
+      },
+      reply.elapsedTime / 1000,
+    );
+
+    const cacheStatus = reply.getHeader('x-cache-status');
+    if (typeof cacheStatus === 'string') {
+      metrics.cacheLookups.inc({
+        tier:
+          cacheStatus === 'L1-HIT' ? 'l1' : cacheStatus === 'L2-HIT' ? 'l2' : 'db',
+      });
+    }
+    done();
+  });
+
+  // ── Health ─────────────────────────────────────────────────────────────────
+  const checkPostgres = async (): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      await withTimeout(
+        Promise.resolve(dbHandle.db.execute(sql`select 1`)),
+        READINESS_TIMEOUT_MS,
+        'postgres',
+      );
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'unknown' };
+    }
+  };
+
+  const checkRedis = async (): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      await withTimeout(redis.ping(), READINESS_TIMEOUT_MS, 'redis');
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'unknown' };
+    }
+  };
+
+  // Liveness — the process is up. Never touches dependencies.
+  app.get('/health', async () => ({
+    status: 'ok',
+    l1Entries: cache.l1Size(),
+    sseClients: hub.size,
+  }));
+
+  app.get('/health/live', async () => ({ status: 'ok' }));
+
+  /**
+   * Readiness — can this instance serve correct traffic?
+   *
+   * PostgreSQL is a hard dependency: cold reads and every control-plane write
+   * need it. Redis is an optimisation, and the read path degrades to L1 + DB
+   * without it, so a Redis outage is reported as `degraded` (HTTP 200) rather
+   * than `unavailable`, and the orchestrator keeps routing to this instance.
+   */
+  app.get('/health/ready', async (_req, reply) => {
+    const [postgres, redisCheck] = await Promise.all([
+      checkPostgres(),
+      checkRedis(),
+    ]);
+
+    metrics.readinessChecks.inc({
+      check: 'postgres',
+      result: postgres.ok ? 'ok' : 'fail',
+    });
+    metrics.readinessChecks.inc({
+      check: 'redis',
+      result: redisCheck.ok ? 'ok' : 'fail',
+    });
+
+    const status = !postgres.ok
+      ? 'unavailable'
+      : redisCheck.ok
+        ? 'ready'
+        : 'degraded';
+
+    return reply.code(postgres.ok ? 200 : 503).send({
+      status,
+      checks: {
+        postgres: postgres.ok ? { ok: true } : { ok: false, error: postgres.error },
+        redis: redisCheck.ok ? { ok: true } : { ok: false, error: redisCheck.error },
+      },
+      sseClients: hub.size,
+      l1Entries: cache.l1Size(),
+    });
+  });
 
   // ── Invalidation subscriber → L1 refresh → SSE fan-out ─────────────────────
   const onInvalidation: InvalidationHandler = async (message) => {
@@ -118,6 +336,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           : { flags: snapshot.flags }),
       }),
     );
+    metrics.invalidations.inc({ action: message.action });
     app.log.debug(
       {
         environmentId: message.environmentId,
@@ -143,12 +362,6 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   // Keep SSE connections alive through proxies.
   const heartbeat = setInterval(() => hub.heartbeat(), 20_000);
   heartbeat.unref();
-
-  app.get('/health', async () => ({
-    status: 'ok',
-    l1Entries: cache.l1Size(),
-    sseClients: hub.size,
-  }));
 
   // ── Error handling ─────────────────────────────────────────────────────────
   app.setErrorHandler((error, req, reply) => {
@@ -188,7 +401,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   // ── Graceful shutdown ──────────────────────────────────────────────────────
   app.addHook('onClose', async () => {
     clearInterval(heartbeat);
-    hub.closeAll();
+    // Tell SSE clients to reconnect promptly instead of cutting them silently.
+    hub.closeAll('server shutting down');
     await bus.stop();
     if (ownsSub) redisSub.disconnect();
     if (ownsRedis) redis.disconnect();
