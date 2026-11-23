@@ -1,7 +1,9 @@
-import { SandboxClient } from '@/components/SandboxClient';
+import { redirect } from 'next/navigation';
 
-export const dynamic = 'force-dynamic';
-
+/**
+ * The original single-project sandbox has been replaced by the authenticated
+ * dashboard (Feature Flags / Audit Log / SDK & Keys / Live Playground).
+ */
 export default function SandboxPage() {
-  return <SandboxClient />;
+  redirect('/dashboard');
 }
