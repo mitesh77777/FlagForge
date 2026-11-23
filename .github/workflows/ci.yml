@@ -46,6 +46,7 @@ jobs:
 
     env:
       DATABASE_URL: postgres://flagforge:flagforge@localhost:5432/flagforge
+      DATABASE_TEST_URL: postgres://flagforge:flagforge@localhost:5432/flagforge
       REDIS_URL: redis://localhost:6379
       CACHE_NAMESPACE: flagforge-ci
 
@@ -61,6 +62,13 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # The journey test needs real tables, so migrate before running the suite.
+      - name: Prepare test database
+        run: |
+          pnpm --filter @flagforge/evaluator build
+          pnpm --filter @flagforge/api build
+          node apps/api/dist/db/migrate.js
 
       - name: Typecheck + lint
         run: pnpm turbo run typecheck lint
@@ -145,29 +153,54 @@ jobs:
           done
           curl -sf http://127.0.0.1:8080/health > /dev/null
 
-          echo "Control plane: GET /api/sandbox"
-          curl -sf http://127.0.0.1:8080/api/sandbox | head -c 200; echo
+          echo "Readiness: GET /health/ready"
+          curl -sf http://127.0.0.1:8080/health/ready; echo
 
-          echo "Data plane: POST /v1/evaluate (cold → DB-FALLBACK)"
+          echo "Control plane: GET /api/sandbox"
+          SANDBOX=$(curl -sf http://127.0.0.1:8080/api/sandbox)
+          echo "$SANDBOX" | head -c 200; echo
+          ENV_ID=$(echo "$SANDBOX" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);const e=j.environments.find(x=>x.name==='prod')||j.environments[0];process.stdout.write(e.id)})")
+
+          # Rotate BEFORE the outgoing key has ever been resolved in this process.
+          # The service memoises key hashes, so using the old key first would make
+          # the check below pass even with a broken grace window.
+          echo "Rotation: POST /api/environments/$ENV_ID/rotate-key"
+          ROTATED=$(curl -sf -X POST "http://127.0.0.1:8080/api/environments/$ENV_ID/rotate-key" \
+            -H 'content-type: application/json' -d '{"tier":"live"}')
+          echo "$ROTATED"
+          NEW_KEY=$(echo "$ROTATED" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>process.stdout.write(JSON.parse(d).sdkKey))")
+
+          echo "Rotation: outgoing key must still authenticate, resolved from PostgreSQL"
           curl -sfi -X POST http://127.0.0.1:8080/v1/evaluate \
             -H 'content-type: application/json' \
             -H 'x-sdk-key: ff_live_demo_7f3a91c4e8b25d60' \
-            -d '{"userId":"user_demo_001","attributes":{"plan":"enterprise"}}' \
+            -d '{"key":"new-checkout-flow","userId":"user_demo_001","attributes":{"plan":"enterprise"}}' \
             | tr -d '\r' | grep -iE '^(HTTP/|x-cache-status|x-eval-time-ms)'
+
+          echo "Rotation: new key must authenticate"
+          curl -sf -X POST http://127.0.0.1:8080/v1/evaluate \
+            -H 'content-type: application/json' \
+            -H "x-sdk-key: $NEW_KEY" \
+            -d '{"key":"new-checkout-flow","userId":"user_demo_001","attributes":{"plan":"enterprise"}}' \
+            | head -c 200; echo
 
           echo "Data plane: POST /v1/evaluate (warm → L1-HIT)"
           curl -sfi -X POST http://127.0.0.1:8080/v1/evaluate \
             -H 'content-type: application/json' \
             -H 'x-sdk-key: ff_live_demo_7f3a91c4e8b25d60' \
-            -d '{"userId":"user_demo_001","attributes":{"plan":"enterprise"}}' \
+            -d '{"key":"new-checkout-flow","userId":"user_demo_001","attributes":{"plan":"enterprise"}}' \
             | tr -d '\r' | grep -iE '^(HTTP/|x-cache-status|x-eval-time-ms)'
 
           echo "Data plane: POST /v1/evaluate/batch"
           curl -sf -X POST http://127.0.0.1:8080/v1/evaluate/batch \
             -H 'content-type: application/json' \
-            -H 'x-sdk-key: ff_live_demo_7f3a91c4e8b25d60' \
+            -H "x-sdk-key: $NEW_KEY" \
             -d '{"userId":"user_demo_002","attributes":{"plan":"pro","country":"US"}}' \
             | head -c 300; echo
+
+          echo "Observability: GET /metrics exposes flagforge series"
+          curl -sf http://127.0.0.1:8080/metrics | grep -c '^flagforge_' \
+            | sed 's/^/  flagforge metric series: /'
 
           echo "AI: GET /api/ai/status"
           curl -sf http://127.0.0.1:8080/api/ai/status; echo
