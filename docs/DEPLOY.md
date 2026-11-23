@@ -10,7 +10,59 @@ This is the provisioning checklist for the chosen stack:
 | Web | **Vercel** (`apps/web` + `apps/web/vercel.json`) |
 
 Everything that can be done ahead of time is already in the repository:
-`fly.toml`, `apps/web/vercel.json`, the `PORT` fallback, and the deploy-safe seed.
+`fly.toml`, `render.yaml`, `apps/web/vercel.json`, the `PORT` fallback, and the
+deploy-safe seed.
+
+---
+
+## Zero-card path (recommended if you have no payment method)
+
+**Render** free web service (no card) for the API + **Vercel** free for the web
+app. `render.yaml` is committed, so the API is a blueprint import rather than
+manual configuration.
+
+| Free-tier reality | Impact here |
+| --- | --- |
+| Render sleeps a free service after ~15 min idle | First visit pays a 30–60s cold start; an open SSE connection keeps it awake while someone is browsing |
+| Render free is 512 MB / 0.1 CPU | Fine for a demo; not for load testing |
+| Neon auto-suspends after ~5 min idle | First query after a pause adds ~0.5–1s |
+| Upstash free allows ~10k commands/day | Fine here — L1 means most requests never reach Redis |
+| Render free has no release command | Migrations run in the container `CMD` on boot (idempotent) |
+
+Steps:
+
+1. **Render** → *New +* → **Blueprint** → select this repo → **Apply**. Render
+   reads `render.yaml` and prompts for `DATABASE_URL`, `REDIS_URL`, `CORS_ORIGINS`
+   and optionally `LLM_API_KEY`. `SESSION_SECRET` is generated for you. Leave
+   `CORS_ORIGINS` blank for now.
+2. Wait for the first deploy, note the URL (e.g. `https://flagforge-api.onrender.com`)
+   and confirm `…/health/ready` returns `200`.
+3. **Vercel** → *Add New…* → **Project** → import the repo → **Root Directory**
+   `apps/web` → add `NEXT_PUBLIC_API_URL=https://flagforge-api.onrender.com` →
+   **Deploy**.
+4. Close the loop: on Render set `CORS_ORIGINS=https://<your-app>.vercel.app`
+   (no trailing slash) and let it redeploy.
+5. Verify: open the web URL → **Try Interactive Demo**.
+
+**Verify Upstash Pub/Sub before counting on instant updates.** If the plan does
+not support it, invalidation still works but is bounded by
+`L2_CACHE_TTL_SECONDS` (300s) rather than instant:
+
+```bash
+cd apps/api
+export REDIS_URL='rediss://default:…@…upstash.io:6379'   # your rotated password
+node -e "const R=require('ioredis');const s=new R(process.env.REDIS_URL);s.subscribe('flag_invalidation',e=>{console.log(e?'PUBSUB FAIL: '+e.message:'PUBSUB OK');process.exit(e?1:0)});setTimeout(()=>{console.log('PUBSUB TIMEOUT');process.exit(1)},8000)"
+```
+
+If it fails the API still serves correctly: `/health/ready` reports `degraded`
+and flag changes take up to the TTL to propagate.
+
+---
+
+### Alternative: Fly.io (requires a card)
+
+The rest of this document describes the Fly.io path — a better runtime (no
+scale-to-zero, always-on SSE) but it needs a payment method on file.
 
 ## Your steps (the only ones that need your credentials)
 

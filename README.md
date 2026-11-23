@@ -17,6 +17,7 @@ Control plane and data plane are strictly separated, the read path is served fro
 - [API reference](#api-reference)
 - [Evaluation semantics](#evaluation-semantics)
 - [Caching & invalidation](#caching--invalidation)
+- [Operations](#operations)
 - [SDK](#sdk)
 - [AI rule compiler](#ai-rule-compiler)
 - [Testing](#testing)
@@ -114,7 +115,37 @@ docker compose up --build
 | API | <http://localhost:8080> |
 | Health | <http://localhost:8080/health> |
 
-The API container runs migrations and an idempotent seed on boot, creating the `flagforge-demo` project, `prod`/`dev` environments and four flags.
+The API container runs migrations and an idempotent seed on boot, creating the
+`flagforge-demo` workspace (owned by the demo account), its `prod`/`dev`
+environments and four flags.
+
+Open the app and either **create your own account** at `/signup` (you get a
+project with `development` + `production` environments and real SDK keys shown
+once), or click **Try Interactive Demo** to sign straight into the seeded
+workspace:
+
+```
+demo@flagforge.dev / demo1234
+```
+
+### Run the UI without infrastructure
+
+If Docker/Postgres/Redis aren't available, a local preview harness serves the
+full product from memory while reusing the real evaluator, AI compiler and
+simulator:
+
+```bash
+pnpm build                                   # dist/ for the harness imports
+pnpm demo                                    # API on :8080
+pnpm --filter @flagforge/web start           # web on :3000
+```
+
+The harness is a preview only: persistence is in-memory, passwords are not
+verified, and data resets on restart. The production API is `apps/api`.
+
+**Full usage guide:** [`docs/USING.md`](./docs/USING.md) — what you need, how to
+use each screen, and how to prove it works from an external application
+(`node examples/quickstart.mjs`).
 
 ### 2. Local (host processes, Docker for infra)
 
@@ -173,13 +204,15 @@ Only their SHA-256 hashes are stored in PostgreSQL.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/health`, `/api/health` | Liveness + L1/SSE counts |
+| `GET` | `/health`, `/health/live`, `/api/health` | Liveness — never touches a dependency |
+| `GET` | `/health/ready` | Readiness — PostgreSQL required, Redis optional (`degraded`) |
+| `GET` | `/metrics` | Prometheus exposition (admin-token guarded, rate-limit exempt) |
 | `GET` | `/api/sandbox` | Zero-login bootstrap: project, environments, flags, audit logs, demo keys |
 | `GET` | `/api/projects` | List projects |
 | `POST` | `/api/projects` | Create project |
 | `GET` | `/api/environments?projectId=` | List environments |
 | `POST` | `/api/environments` | Create environment (returns the raw SDK key **once**) |
-| `POST` | `/api/environments/:id/rotate-key` | Rotate the SDK key for a tier |
+| `POST` | `/api/environments/:id/rotate-key` | Rotate the SDK key; the outgoing key stays valid for the grace window |
 | `GET` | `/api/environments/:id/flags` | List flags (reads PostgreSQL) |
 | `POST` | `/api/environments/:id/flags` | Create flag |
 | `GET` | `/api/flags/:id` | Get one flag |
@@ -264,6 +297,56 @@ Guarantees:
 - **L1 is purged before publishing**, so a racing read can't serve stale data.
 - **Redis is never a dependency.** L2 errors degrade to L1+DB; a failed subscription starts the process in degraded mode and the defensive TTL bounds staleness.
 - **SSE is push-only.** Invalidation → refresh L1 → fan out per-client evaluated results. No polling from the SDK.
+
+---
+
+## Operations
+
+### Health probes
+
+| Endpoint | Purpose | Behaviour |
+| --- | --- | --- |
+| `GET /health`, `/health/live` | Liveness | Always `200`. Never touches a dependency, so a slow database cannot cause a restart loop. |
+| `GET /health/ready` | Readiness | Checks PostgreSQL (hard dependency) and Redis (an optimisation). Returns `503 unavailable` **only** when PostgreSQL is unreachable; a Redis outage returns `200 degraded`, because the read path still serves correct results from L1 + PostgreSQL. |
+
+`fly.toml` probes `/health/ready`, so a machine that has lost PostgreSQL is pulled
+out of rotation while a machine that has lost Redis keeps serving.
+
+### Metrics
+
+`GET /metrics` serves Prometheus text exposition, guarded by `ADMIN_API_TOKEN`
+when one is set and exempt from rate limiting.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `flagforge_http_request_duration_seconds` | histogram | Latency by method, route, status |
+| `flagforge_cache_lookups_total{tier}` | counter | Snapshot resolutions by `l1` / `l2` / `db` |
+| `flagforge_snapshot_loads_total{cause}` | counter | Cold loads: `postgres` (led) vs `coalesced` (joined an in-flight load) |
+| `flagforge_invalidations_total{action}` | counter | Pub/Sub invalidations applied |
+| `flagforge_ai_compiles_total{source}` | counter | `llm` vs `fallback` compilations |
+| `flagforge_readiness_checks_total{check,result}` | counter | Probe outcomes per dependency |
+| `flagforge_sse_clients` | gauge | Connected SSE clients |
+| `flagforge_inflight_snapshot_loads` | gauge | Environments with a load in flight |
+
+Plus the standard `process_*` and `nodejs_*` collectors.
+
+### Abuse protection
+
+- Data-plane requests are limited per **SDK key** (`RATE_LIMIT_DATA_MAX`, default
+  20 000 per window); control-plane requests per **client IP**
+  (`RATE_LIMIT_CONTROL_MAX`, default 120).
+- `/health*` and `/metrics` are never limited, so probes and scrapes can't be
+  starved by tenant traffic.
+- Raise `RATE_LIMIT_DATA_MAX` (or set `RATE_LIMIT_ENABLED=false`) before running
+  the k6 load test.
+
+### Zero-downtime SDK key rotation
+
+`POST /api/environments/:id/rotate-key` demotes the outgoing key into a secondary
+slot that keeps authenticating until `previousKeyExpiresAt`
+(`SDK_KEY_ROTATION_GRACE_SECONDS`, default 24 h). Both keys resolve to the same
+environment, so a rolling deploy never produces a window of `401`s. Set the grace
+to `0` for a hard cutover.
 
 ---
 

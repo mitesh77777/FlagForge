@@ -352,3 +352,73 @@ apply, optional secrets stay absent, and a blank `PORT` is ignored.
 **Consequences.** `.env`-driven, compose-driven and platform-driven starts all
 agree, and a blank line in a config file can no longer take the service down.
 `apps/api/src/config.test.ts` locks the behaviour in.
+
+---
+
+## 21. Readiness depends on PostgreSQL, not Redis
+
+**Context.** A single `/health` endpoint that returns `200` unconditionally tells
+an orchestrator nothing. The obvious fix — fail readiness when either dependency
+is unreachable — is wrong here, because Redis is deliberately optional: the read
+path degrades to L1 + PostgreSQL, and the API continues returning *correct*
+results without it.
+
+**Decision.** Split liveness from readiness. Liveness (`/health`, `/health/live`)
+never touches a dependency. Readiness (`/health/ready`) probes both, returns `503`
+only when PostgreSQL is unreachable, and reports `200 degraded` when Redis is
+down. `fly.toml` probes the readiness path.
+
+**Consequences.** A Redis outage does not remove healthy machines from rotation
+and therefore cannot turn a degradation into an outage. An orchestrator can still
+distinguish the two states from the probe body and the
+`flagforge_readiness_checks_total{check,result}` metric.
+
+---
+
+## 22. Coalesce cold loads, but never coalesce an invalidation refresh
+
+**Context.** When a cache entry is cold, every concurrent request for that
+environment misses L1 and L2 and queries PostgreSQL independently. A deploy or a
+cache flush therefore produces a stampede proportional to in-flight requests
+rather than to the number of environments.
+
+**Decision.** `EvaluationService` passes its cold path through a `Singleflight`
+keyed by environment id, and populates both cache tiers *inside* the coalesced
+load so a group performs exactly one query and one write.
+
+`refreshEnvironment` is deliberately **not** coalesced. A refresh is triggered by
+an invalidation, which means the database already holds newer data than any load
+that may currently be in flight. Joining such a load would repopulate L1 with the
+pre-invalidation snapshot and serve stale flags until the next invalidation or TTL
+expiry — a correctness bug traded for a micro-optimisation.
+
+**Consequences.** Cold-start database load is bounded by the number of distinct
+environments, observable via `flagforge_snapshot_loads_total{cause}` and
+`flagforge_inflight_snapshot_loads`. The extra query during a refresh race is
+cheap and always correct.
+
+---
+
+## 23. A rotation grace window, because rotation is a cutover
+
+**Context.** Replacing an environment's SDK key hash is an instantaneous cutover:
+every client still holding the old key starts failing at once. On a rolling deploy
+that means a window in which some instances are authenticating with the old key
+and some with the new one — a self-inflicted outage, and the reason key rotation
+is commonly avoided for far longer than it should be.
+
+**Decision.** `environments` gains `sdk_key_prev_hash` and
+`sdk_key_prev_expires_at`. Rotation demotes the outgoing hash into that slot with
+an expiry of `SDK_KEY_ROTATION_GRACE_SECONDS` (default 24 h), and the SDK-key
+lookup matches the primary hash **or** a previous hash whose window is still open.
+The row is read `FOR UPDATE` inside a transaction so two concurrent rotations
+cannot interleave and lose one of the outgoing keys. A grace of `0` restores the
+hard cutover.
+
+**Consequences.** Rotation becomes a non-event for running clients, and the
+window is visible in the API response as `previousKeyExpiresAt`. The cost is one
+nullable column pair and an index; the previous hash is cleared by the next
+rotation, so at most two keys are ever valid. The CI smoke test rotates a key and
+then authenticates with the *outgoing* key against real PostgreSQL, which is the
+only way to prove the window works — the in-process key memo would mask a broken
+implementation in a single-instance test.
