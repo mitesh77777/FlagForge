@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { and, desc, eq } from 'drizzle-orm';
 import type { FlagConfig, JsonValue } from '@flagforge/evaluator';
 import type { Database } from '../db/client.js';
@@ -7,8 +8,9 @@ import type { FlagInput, FlagUpdate } from '../schemas.js';
 import type { FlagCache, EnvSnapshot } from '../data-plane/cache.js';
 import type { InvalidationBus } from '../data-plane/invalidation.js';
 import type { SnapshotLoader } from '../data-plane/service.js';
-import { ConflictError, NotFoundError } from '../lib/errors.js';
+import { ConflictError, NotFoundError, ValidationError } from '../lib/errors.js';
 import { generateSdkKey, hashSdkKey, sdkKeyPrefix, type KeyTier } from '../lib/sdk-key.js';
+import { rotationExpiry } from '../lib/rotation.js';
 
 export const DEMO_PROJECT_SLUG = 'flagforge-demo';
 
@@ -116,6 +118,183 @@ export class FlagService {
     return row;
   }
 
+  // ── Ownership ──────────────────────────────────────────────────────────────
+  // Every control-plane read/write funnels through one of these. They return
+  // 404 (not 403) for records the caller does not own, so an authenticated user
+  // can never confirm that another tenant's id exists.
+
+  async listProjectsFor(ownerId: string) {
+    return this.deps.db
+      .select()
+      .from(projects)
+      .where(eq(projects.ownerId, ownerId))
+      .orderBy(projects.createdAt);
+  }
+
+  /**
+   * Environment listing scoped to an owner (optionally one project).
+   * Never exposes hashes — only the non-secret display prefix.
+   */
+  async listEnvironmentsForOwner(ownerId: string, projectId?: string) {
+    const filters = [eq(projects.ownerId, ownerId)];
+    if (projectId) filters.push(eq(environments.projectId, projectId));
+
+    const rows = await this.deps.db
+      .select({
+        id: environments.id,
+        projectId: environments.projectId,
+        name: environments.name,
+        sdkKeyPrefix: environments.sdkKeyPrefix,
+        createdAt: environments.createdAt,
+        previousKeyExpiresAt: environments.sdkKeyPrevExpiresAt,
+      })
+      .from(environments)
+      .innerJoin(projects, eq(environments.projectId, projects.id))
+      .where(and(...filters))
+      .orderBy(environments.name);
+
+    return rows.map((row) => ({
+      id: row.id,
+      projectId: row.projectId,
+      name: row.name,
+      sdkKeyPrefix: row.sdkKeyPrefix,
+      createdAt: row.createdAt.toISOString(),
+      previousKeyExpiresAt: row.previousKeyExpiresAt
+        ? row.previousKeyExpiresAt.toISOString()
+        : null,
+    }));
+  }
+
+  async assertProjectOwned(projectId: string, ownerId: string) {
+    const [row] = await this.deps.db
+      .select({ id: projects.id, name: projects.name, slug: projects.slug })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.ownerId, ownerId)))
+      .limit(1);
+    if (!row) throw new NotFoundError('project not found');
+    return row;
+  }
+
+  async assertEnvironmentOwned(environmentId: string, ownerId: string) {
+    const [row] = await this.deps.db
+      .select({
+        id: environments.id,
+        projectId: environments.projectId,
+        name: environments.name,
+        sdkKeyPrefix: environments.sdkKeyPrefix,
+        sdkKeyPrevExpiresAt: environments.sdkKeyPrevExpiresAt,
+      })
+      .from(environments)
+      .innerJoin(projects, eq(environments.projectId, projects.id))
+      .where(and(eq(environments.id, environmentId), eq(projects.ownerId, ownerId)))
+      .limit(1);
+    if (!row) throw new NotFoundError('environment not found');
+    return row;
+  }
+
+  async assertFlagOwned(flagId: string, ownerId: string) {
+    const [row] = await this.deps.db
+      .select({
+        id: flags.id,
+        environmentId: flags.environmentId,
+        key: flags.key,
+      })
+      .from(flags)
+      .innerJoin(environments, eq(flags.environmentId, environments.id))
+      .innerJoin(projects, eq(environments.projectId, projects.id))
+      .where(and(eq(flags.id, flagId), eq(projects.ownerId, ownerId)))
+      .limit(1);
+    if (!row) throw new NotFoundError('flag not found');
+    return row;
+  }
+
+  // ── Project provisioning ────────────────────────────────────────────────────
+
+  /** Derive a globally unique, URL-safe slug (projects.slug is unique). */
+  private async uniqueSlug(name: string): Promise<string> {
+    const base =
+      name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 40) || 'project';
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const candidate =
+        attempt === 0 ? base : `${base}-${randomBytes(2).toString('hex')}`;
+      const [existing] = await this.deps.db
+        .select({ id: projects.id })
+        .from(projects)
+        .where(eq(projects.slug, candidate))
+        .limit(1);
+      if (!existing) return candidate;
+    }
+    return `${base}-${randomBytes(4).toString('hex')}`;
+  }
+
+  /**
+   * Creates a project plus its two environments in one transaction and returns
+   * each raw SDK key exactly once. Used by signup and "New Project".
+   */
+  async createProjectWithEnvironments(ownerId: string, input: { name: string }) {
+    const name = input.name.trim();
+    if (name.length === 0) throw new ValidationError('project name is required');
+
+    const slug = await this.uniqueSlug(name);
+
+    return this.deps.db.transaction(async (tx) => {
+      const [project] = await tx
+        .insert(projects)
+        .values({ ownerId, name, slug })
+        .returning();
+      if (!project) throw new Error('failed to create project');
+
+      const specs: Array<{ name: string; tier: KeyTier }> = [
+        { name: 'development', tier: 'test' },
+        { name: 'production', tier: 'live' },
+      ];
+
+      const created: Array<{
+        id: string;
+        name: string;
+        tier: KeyTier;
+        sdkKey: string;
+        sdkKeyPrefix: string;
+      }> = [];
+
+      for (const spec of specs) {
+        const rawKey = generateSdkKey(spec.tier);
+        const [row] = await tx
+          .insert(environments)
+          .values({
+            projectId: project.id,
+            name: spec.name,
+            sdkKeyHash: hashSdkKey(rawKey),
+            sdkKeyPrefix: sdkKeyPrefix(rawKey),
+          })
+          .returning();
+        if (!row) throw new Error('failed to create environment');
+        created.push({
+          id: row.id,
+          name: row.name,
+          tier: spec.tier,
+          sdkKey: rawKey,
+          sdkKeyPrefix: row.sdkKeyPrefix,
+        });
+      }
+
+      return {
+        project: {
+          id: project.id,
+          name: project.name,
+          slug: project.slug,
+          createdAt: project.createdAt.toISOString(),
+        },
+        environments: created,
+      };
+    });
+  }
+
   /** Creates an environment and returns the RAW SDK key exactly once. */
   async createEnvironment(input: { projectId: string; name: string; tier: KeyTier }) {
     const [project] = await this.deps.db
@@ -149,17 +328,52 @@ export class FlagService {
     };
   }
 
-  /** Rotates an environment's SDK key, returning the new RAW key once. */
-  async rotateSdkKey(environmentId: string, tier: KeyTier) {
-    await this.getEnvironment(environmentId);
+  /**
+   * Rotates an environment's SDK key, returning the new RAW key exactly once.
+   *
+   * The outgoing key is demoted to the previous-key slot and keeps
+   * authenticating until `previousKeyExpiresAt`, so a rolling deploy never hits
+   * a window of 401s. `graceSeconds <= 0` performs a hard cutover.
+   */
+  async rotateSdkKey(environmentId: string, tier: KeyTier, graceSeconds = 0) {
     const rawKey = generateSdkKey(tier);
-    const [row] = await this.deps.db
-      .update(environments)
-      .set({ sdkKeyHash: hashSdkKey(rawKey), sdkKeyPrefix: sdkKeyPrefix(rawKey) })
-      .where(eq(environments.id, environmentId))
-      .returning();
-    if (!row) throw new NotFoundError(`environment ${environmentId} not found`);
-    return { sdkKey: rawKey, sdkKeyPrefix: row.sdkKeyPrefix };
+    const previousKeyExpiresAt = rotationExpiry(graceSeconds);
+
+    const row = await this.deps.db.transaction(async (tx) => {
+      // Lock the row so two concurrent rotations cannot interleave and lose one
+      // of the outgoing keys.
+      const [current] = await tx
+        .select()
+        .from(environments)
+        .where(eq(environments.id, environmentId))
+        .for('update')
+        .limit(1);
+      if (!current) {
+        throw new NotFoundError(`environment ${environmentId} not found`);
+      }
+
+      const [updated] = await tx
+        .update(environments)
+        .set({
+          sdkKeyHash: hashSdkKey(rawKey),
+          sdkKeyPrefix: sdkKeyPrefix(rawKey),
+          sdkKeyPrevHash: current.sdkKeyHash,
+          sdkKeyPrevExpiresAt: previousKeyExpiresAt,
+        })
+        .where(eq(environments.id, environmentId))
+        .returning();
+      return updated!;
+    });
+
+    return {
+      environmentId: row.id,
+      environment: row.name,
+      sdkKey: rawKey,
+      sdkKeyPrefix: row.sdkKeyPrefix,
+      previousKeyExpiresAt: row.sdkKeyPrevExpiresAt
+        ? row.sdkKeyPrevExpiresAt.toISOString()
+        : null,
+    };
   }
 
   // ── Flags ──────────────────────────────────────────────────────────────────

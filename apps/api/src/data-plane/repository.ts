@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { and, eq, gt, isNull, or } from 'drizzle-orm';
 import type { FlagConfig } from '@flagforge/evaluator';
 import type { Database } from '../db/client.js';
 import { environments, flags } from '../db/schema.js';
@@ -20,7 +20,20 @@ export function createDbSnapshotLoader(db: Database): SnapshotLoader {
           sdkKeyPrefix: environments.sdkKeyPrefix,
         })
         .from(environments)
-        .where(eq(environments.sdkKeyHash, keyHash))
+        .where(
+          // Accept the outgoing key too while its grace window is open, so a
+          // rotation never produces a window of 401s on a rolling deploy.
+          or(
+            eq(environments.sdkKeyHash, keyHash),
+            and(
+              eq(environments.sdkKeyPrevHash, keyHash),
+              or(
+                isNull(environments.sdkKeyPrevExpiresAt),
+                gt(environments.sdkKeyPrevExpiresAt, new Date()),
+              ),
+            ),
+          ),
+        )
         .limit(1);
       return row ?? null;
     },
