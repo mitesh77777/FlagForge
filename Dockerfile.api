@@ -29,7 +29,10 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV API_HOST=0.0.0.0
-ENV API_PORT=8080
+# NOTE: do not pin API_PORT here. Managed hosts (Render, Railway, Cloud Run…) inject
+# PORT and route traffic to it. The config resolves `API_PORT ?? PORT ?? 8080`, so
+# hardcoding API_PORT would make the container listen on a port nothing forwards.
+# Fly pins PORT=8080 in fly.toml; docker-compose sets API_PORT explicitly.
 
 COPY --from=build /app/package.json /app/pnpm-workspace.yaml ./
 COPY --from=build /app/node_modules ./node_modules

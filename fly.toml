@@ -42,11 +42,14 @@ primary_region = "sin"
   min_machines_running = 1
 
   [[http_service.checks]]
+    # Readiness, not liveness: PostgreSQL is a hard dependency, so a machine that
+    # cannot reach it must be pulled out of rotation. A Redis outage reports
+    # `degraded` with HTTP 200 and deliberately stays in service.
     interval = "15s"
     timeout = "5s"
     grace_period = "30s"
     method = "GET"
-    path = "/health"
+    path = "/health/ready"
 
 [[vm]]
   size = "shared-cpu-1x"
