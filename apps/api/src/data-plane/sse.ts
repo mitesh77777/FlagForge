@@ -93,9 +93,21 @@ export class SseHub {
     return this.clients.size;
   }
 
-  closeAll(): void {
+  /**
+   * Close every stream. When `reason` is supplied, clients first receive a
+   * `retry:` hint and a final `shutdown` event, so the browser EventSource
+   * reconnects promptly (to whichever instance is still serving) instead of
+   * treating the close as a fatal error.
+   */
+  closeAll(reason?: string): void {
     for (const client of this.clients.values()) {
       try {
+        if (reason) {
+          client.res.write('retry: 1000\n\n');
+          client.res.write(
+            `event: shutdown\ndata: ${JSON.stringify({ reason })}\n\n`,
+          );
+        }
         client.res.end();
       } catch {
         /* ignore */

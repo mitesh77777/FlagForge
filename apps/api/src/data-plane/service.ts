@@ -1,4 +1,5 @@
 import { evaluateFlag, type EvaluationContext, type EvaluationResult, type FlagConfig } from '@flagforge/evaluator';
+import { Singleflight } from '../lib/singleflight.js';
 import type { EnvSnapshot, CacheStatus, FlagCache } from './cache.js';
 
 export interface EnvironmentRef {
@@ -25,6 +26,14 @@ export interface BatchOutcome {
   cacheStatus: CacheStatus;
 }
 
+export interface EvaluationServiceOptions {
+  /**
+   * Called after a cold snapshot load. `coalesced` is `true` when this caller
+   * joined an in-flight load rather than querying PostgreSQL itself.
+   */
+  onSnapshotLoad?: (info: { coalesced: boolean }) => void;
+}
+
 /**
  * The read path. Implements L1 → L2 → DB resolution with strict "no DB on cache
  * hit" semantics, and exposes explicit invalidation hooks used by the Pub/Sub
@@ -34,9 +43,13 @@ export class EvaluationService {
   /** Environment resolution is tiny and immutable enough to memoise in-process. */
   private readonly envRefs = new Map<string, EnvironmentRef>();
 
+  /** Coalesces concurrent cold loads so a stampede costs one query per environment. */
+  private readonly flight = new Singleflight();
+
   constructor(
     private readonly cache: FlagCache,
     private readonly loader: SnapshotLoader,
+    private readonly options: EvaluationServiceOptions = {},
   ) {}
 
   // ── Environment / SDK-key resolution ───────────────────────────────────────
@@ -65,9 +78,19 @@ export class EvaluationService {
       return { snapshot: l2, cacheStatus: 'L2-HIT' };
     }
 
-    const snapshot = await this.loader.loadSnapshot(environmentId);
-    this.cache.setL1(snapshot);
-    await this.cache.setL2(snapshot);
+    // Cold. Coalesce concurrent misses, and populate both tiers *inside* the
+    // single load so a coalesced group performs exactly one query and one write.
+    const { value: snapshot, joined } = await this.flight.run(
+      `snapshot:${environmentId}`,
+      async () => {
+        const loaded = await this.loader.loadSnapshot(environmentId);
+        this.cache.setL1(loaded);
+        await this.cache.setL2(loaded);
+        return loaded;
+      },
+    );
+
+    this.options.onSnapshotLoad?.({ coalesced: joined });
     return { snapshot, cacheStatus: 'DB-FALLBACK' };
   }
 
@@ -82,6 +105,11 @@ export class EvaluationService {
   /**
    * Re-read the authoritative snapshot (L2, else DB) and re-populate L1.
    * Returns the fresh snapshot for SSE broadcast.
+   *
+   * Deliberately NOT coalesced. A refresh is triggered by an invalidation, i.e.
+   * the database already holds newer data than any load that may currently be in
+   * flight. Joining such a load would repopulate L1 with the *pre-invalidation*
+   * snapshot and serve stale flags until the next invalidation or TTL expiry.
    */
   async refreshEnvironment(environmentId: string): Promise<EnvSnapshot> {
     this.cache.deleteL1(environmentId);
@@ -131,5 +159,16 @@ export class EvaluationService {
   clearLocalCache(): void {
     this.cache.clearL1();
     this.envRefs.clear();
+  }
+
+  // ── Introspection (surfaced as metrics gauges) ─────────────────────────────
+  /** Distinct environments with a snapshot load in flight right now. */
+  get inflightLoads(): number {
+    return this.flight.size;
+  }
+
+  /** Cumulative callers that coalesced onto someone else's load. */
+  get coalescedLoads(): number {
+    return this.flight.coalescedCalls;
   }
 }
