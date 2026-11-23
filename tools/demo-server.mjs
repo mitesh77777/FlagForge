@@ -672,6 +672,10 @@ const server = createServer(async (req, res) => {
       attributes: body.attributes ?? {},
     })[body.key];
     if (!result) return send(req, res, 404, { error: 'flag_not_found', key: body.key });
+    // Report a genuine progression: the first read for an environment is a cold
+    // load, everything after it is served from the in-memory snapshot.
+    const cacheStatus = warm.has(environment.id) ? 'L1-HIT' : 'DB-FALLBACK';
+    warm.add(environment.id);
     return send(req, res, 200, {
       key: body.key,
       value: result.value,
@@ -681,7 +685,7 @@ const server = createServer(async (req, res) => {
       version: result.version,
       environment: environment.name,
     }, {
-      'x-cache-status': warm.has(environment.id) ? 'L1-HIT' : 'DB-FALLBACK',
+      'x-cache-status': cacheStatus,
       'x-eval-time-ms': (Number(process.hrtime.bigint() - started) / 1e6).toFixed(3),
     });
   }
