@@ -19,7 +19,9 @@
     "db:seed": "pnpm --filter @flagforge/api db:seed",
     "db:push": "pnpm --filter @flagforge/api db:push",
     "up": "docker compose up --build",
-    "down": "docker compose down -v"
+    "down": "docker compose down -v",
+    "demo": "node tools/demo-server.mjs",
+    "preview": "node tools/preview.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.7.4",
