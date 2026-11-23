@@ -4,34 +4,37 @@
 
 :root {
   color-scheme: dark;
+  --line: #1f1f1f;
+  --emerald: #10b981;
 }
 
 html,
 body {
   min-height: 100%;
-  background-color: #07080b;
+  background-color: #000000;
 }
 
 body {
-  color: #e6e8ee;
-  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  color: #fafafa;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings:
+    'cv02' 1,
+    'cv03' 1,
+    'cv04' 1,
+    'ss01' 1;
 }
 
-/* Subtle blueprint grid used on the landing hero. */
-.bg-grid {
-  background-image:
-    linear-gradient(to right, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
-  background-size: 44px 44px;
+::selection {
+  background: rgba(16, 185, 129, 0.28);
+  color: #ffffff;
 }
 
-.bg-radial-fade {
-  background:
-    radial-gradient(60rem 30rem at 50% -10%, rgba(16, 185, 129, 0.14), transparent 70%),
-    radial-gradient(40rem 24rem at 85% 10%, rgba(56, 189, 248, 0.08), transparent 70%);
+/* ── Scrollbars: thin, hairline, unobtrusive ───────────────────────────────── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #1f1f1f transparent;
 }
-
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -40,38 +43,101 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #232833;
-  border-radius: 8px;
-  border: 2px solid #07080b;
+  background: #1f1f1f;
+  border-radius: 999px;
+  border: 3px solid #000000;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #333a48;
+  background: #333333;
 }
 
-/* Range slider */
+/* ── Focus: a crisp emerald hairline, never a glow ─────────────────────────── */
+:focus-visible {
+  outline: 1px solid #10b981;
+  outline-offset: 1px;
+}
+
+/* ── Blueprint grid, used sparingly behind the hero ────────────────────────── */
+.ff-grid {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.028) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.028) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+/* A single soft radial wash, masked to the top — no coloured gradients. */
+.ff-halo {
+  background: radial-gradient(
+    42rem 20rem at 50% -6rem,
+    rgba(255, 255, 255, 0.05),
+    transparent 70%
+  );
+}
+
+.ff-hairline-fade {
+  background: linear-gradient(
+    to right,
+    transparent,
+    #1f1f1f 20%,
+    #1f1f1f 80%,
+    transparent
+  );
+}
+
+/* ── Range slider (rollout percentage) ─────────────────────────────────────── */
 input[type='range'].ff-range {
   -webkit-appearance: none;
   appearance: none;
-  height: 6px;
+  height: 4px;
   border-radius: 999px;
   outline: none;
 }
 input[type='range'].ff-range::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   border-radius: 999px;
-  background: #34d399;
-  border: 2px solid #052e22;
-  box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.12);
-  cursor: pointer;
+  background: #fafafa;
+  border: 1px solid #000000;
+  box-shadow: 0 0 0 1px #333333;
+  cursor: grab;
+  transition: transform 120ms ease;
+}
+input[type='range'].ff-range::-webkit-slider-thumb:active {
+  cursor: grabbing;
+  transform: scale(1.12);
 }
 input[type='range'].ff-range::-moz-range-thumb {
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   border-radius: 999px;
-  background: #34d399;
-  border: 2px solid #052e22;
-  cursor: pointer;
+  background: #fafafa;
+  border: 1px solid #000000;
+  cursor: grab;
+}
+input[type='range'].ff-range:disabled::-webkit-slider-thumb {
+  cursor: not-allowed;
+  background: #4d4d4d;
+}
+
+/* ── Syntax highlighting for code samples ──────────────────────────────────── */
+.tok-key {
+  color: #c084fc;
+}
+.tok-str {
+  color: #86efac;
+}
+.tok-num {
+  color: #fbbf24;
+}
+.tok-com {
+  color: #4d4d4d;
+  font-style: italic;
+}
+.tok-fn {
+  color: #7dd3fc;
+}
+.tok-type {
+  color: #f0abfc;
 }

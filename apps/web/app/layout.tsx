@@ -1,21 +1,38 @@
 import type { Metadata } from 'next';
+import { Inter, JetBrains_Mono } from 'next/font/google';
 import type { ReactNode } from 'react';
 import './globals.css';
 
+const sans = Inter({
+  subsets: ['latin'],
+  variable: '--font-sans',
+  display: 'swap',
+});
+
+const mono = JetBrains_Mono({
+  subsets: ['latin'],
+  variable: '--font-mono',
+  display: 'swap',
+});
+
 export const metadata: Metadata = {
-  title: 'FlagForge — Feature Flags & Gradual Rollout Engine',
+  title: 'FlagForge — Ship behind flags. Evaluate in under 5ms.',
   description:
-    'Control plane / data plane feature flag engine with two-tier caching, deterministic MurmurHash3 bucketing, SSE streaming and an AI rule compiler.',
+    'A deterministic feature flag engine: two-tier L1/Redis caching, Pub/Sub invalidation, sticky MurmurHash3 bucketing, real-time SSE streaming and Zod-validated AI targeting rules.',
+  openGraph: {
+    title: 'FlagForge',
+    description:
+      'Feature flags with two-tier caching, instant Pub/Sub invalidation and sub-5ms evaluation.',
+    type: 'website',
+  },
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: ReactNode;
-}) {
+export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
-      <body className="min-h-screen bg-ink-950 text-zinc-200">{children}</body>
+    <html lang="en" className={`${sans.variable} ${mono.variable}`}>
+      <body className="min-h-screen bg-canvas font-sans text-ink antialiased">
+        {children}
+      </body>
     </html>
   );
 }
