@@ -133,6 +133,16 @@ export const createProjectSchema = z.object({
     .regex(/^[a-z0-9][a-z0-9-]*$/, 'slug must be lowercase kebab-case'),
 });
 
+/** Project creation from the dashboard: the slug is derived and de-duplicated. */
+export const projectCreateSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+});
+
+/** Flag creation addressed by environment id (dashboard flow). */
+export const flagCreateSchema = flagInputSchema.extend({
+  environmentId: z.string().uuid(),
+});
+
 export const createEnvironmentSchema = z.object({
   projectId: z.string().uuid(),
   name: z
