@@ -126,7 +126,13 @@ Verified by execution, not by inspection.
 | Signup flow | New account → both raw keys shown once → empty workspace |
 | **Consumer SSE push** | A separate Node process printed `value true → false` within ~1s of a flag flip, with no polling or restart |
 | **10-account rollout** | `/demo` table showed **6/10 accounts** on `new-checkout-flow`, server-computed |
-| Tenant isolation | Asserted in a test (runs in CI); logic reviewed |
+| Tenant isolation | Asserted as a test — cross-tenant ids return `404` |
+| **Migrations on real PostgreSQL 16** | **Verified in CI** — `migrate` then `seed` succeed in the `build` job |
+| **Journey test** | **Verified in CI** — signup → project → SDK key → flag → evaluate → cache invalidation → cross-tenant 404s |
+| **Redis Pub/Sub invalidation** | **Verified in CI** — two cache instances converge on a new version without a second database read |
+| **End-to-end smoke** | **Verified in CI** — boot, readiness `200`, `flagforge_*` metrics series, SDK key rotation grace, batch evaluation, both AI endpoints, and `401`s for anonymous, forged and unknown-key calls |
+
+Pipeline is green at commit `d3dc4d6`: both `Typecheck · Lint · Test` and `Build · Migrate · Seed · Smoke` pass.
 
 ---
 
@@ -134,14 +140,14 @@ Verified by execution, not by inspection.
 
 This is the most important section.
 
+The migrations, the journey test and the Redis invalidation test are now verified
+in CI. What genuinely remains unexecuted:
+
 | Thing | Status | Risk |
 | --- | --- | --- |
-| Migrations `0000`/`0001`/`0002` against real PostgreSQL | **Never applied.** Hand-authored SQL. | A typo or unsupported statement would fail at first boot. Medium. |
-| `journey.integration.test.ts` (signup → key → flag → evaluate → invalidate → isolation) | Written, gated on `DATABASE_TEST_URL` | Runs in CI, never locally. Medium. |
-| Redis Pub/Sub invalidation across two instances | Written, gated on `REDIS_TEST_URL` | Runs in CI, never locally. Medium. |
-| Multi-instance cache coherence | Designed, never exercised with 2+ processes | The core architectural claim is unproven in practice. High. |
+| Multi-machine cache coherence | In-process two-instance invalidation is verified in CI, but no two real API processes have ever shared one Redis. | The remaining gap in the core architectural claim. Medium–high. |
 | k6 load test | Script exists, never run at load | Thresholds are unvalidated assertions. Medium. |
-| Docker/compose build | Never built (no Docker available) | Medium. |
+| Docker image build (`Dockerfile.api`, `Dockerfile.web`) | Never built — no Docker locally or in CI | A build error would surface only at first deploy. Medium. |
 | Any deployment at all | **Never deployed** | Highest. |
 
 ---
@@ -265,13 +271,15 @@ server-side use.
 
 In rough order, if you put real traffic on this tomorrow:
 
-1. **A migration error on first boot** — the SQL has never run.
-2. **Multi-instance cache incoherence** — the invalidation design is sound but has
-   only ever executed in one process.
+1. **The Docker image build** — never built; a container failure would surface
+   only at first deploy.
+2. **Multi-machine cache coherence** — in-process two-instance invalidation is
+   verified, but no two real API processes have shared one Redis. The design is
+   sound; it is unexercised.
 3. **Per-evaluation round trips under server-side load** — see §7.
-4. **The SSE hub** — every connected client lives in one process's memory map;
-   there is no cross-instance client fan-out beyond Redis invalidation, and no
-   cap on connections.
+4. **The SSE hub** — every connected client lives in one process's memory map,
+   with no cap on connections and no cross-instance client fan-out beyond Redis
+   invalidation.
 5. **PostgreSQL as a single point of failure** — no replica, no failover, no
    documented backup/restore.
 6. **The audit log** — it can be edited, and deleting an environment takes its

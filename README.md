@@ -1,5 +1,7 @@
 # FlagForge
 
+[![CI](https://github.com/mitesh77777/FlagForge/actions/workflows/ci.yml/badge.svg)](https://github.com/mitesh77777/FlagForge/actions/workflows/ci.yml)
+
 A production-grade **feature flag & gradual rollout engine** — a lean LaunchDarkly alternative built as a TypeScript monorepo.
 
 Control plane and data plane are strictly separated, the read path is served from a two-tier cache (`L1` in-process → `L2` Redis → PostgreSQL only on a cold miss), changes propagate over Redis Pub/Sub and reach clients over Server-Sent Events, and an **AI rule compiler** turns plain English into a validated targeting AST — dry-running its blast radius against 1,000 synthetic users before a human clicks **Approve & Publish**.
